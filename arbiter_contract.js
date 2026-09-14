@@ -1,0 +1,1018 @@
+"use strict";
+var db = require("./db.js");
+var device = require("./device.js");
+var composer = require("./composer.js");
+var crypto = require("crypto");
+var arbiters = require("./arbiters.js");
+var objectHash = require("./object_hash.js");
+var wallet_general = require('./wallet_general.js');
+var storage = require("./storage.js");
+var constants = require("./constants.js");
+var http = require("https");
+var url = require("url");
+var _ = require('lodash');
+var eventBus = require('./event_bus.js');
+
+var status_PENDING = "pending";
+exports.CHARGE_AMOUNT = 4000;
+exports.NEW_HASH_DATE = '2026-11-01';
+exports.DELIMITER = "[|#|]";
+
+function createAndSend(objContract, cb) {
+	objContract = _.cloneDeep(objContract);
+	objContract.creation_date = new Date().toISOString().slice(0, 19).replace('T', ' ');
+	objContract.hash = getHash(objContract);
+	device.getOrGeneratePermanentPairingInfo(pairingInfo => {
+		objContract.my_pairing_code = pairingInfo.device_pubkey + "@" + pairingInfo.hub + "#" + pairingInfo.pairing_secret;
+		db.query("INSERT INTO wallet_arbiter_contracts (hash, peer_address, peer_device_address, my_address, arbiter_address, me_is_payer, my_party_name, peer_party_name, amount, asset, is_incoming, creation_date, ttl, status, title, text, my_contact_info, my_pairing_code, cosigners) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [objContract.hash, objContract.peer_address, objContract.peer_device_address, objContract.my_address, objContract.arbiter_address, objContract.me_is_payer ? 1 : 0, objContract.my_party_name, objContract.peer_party_name, objContract.amount, objContract.asset, 0, objContract.creation_date, objContract.ttl, status_PENDING, objContract.title, objContract.text, objContract.my_contact_info, objContract.my_pairing_code, JSON.stringify(objContract.cosigners)], function() {
+				var objContractForPeer = _.cloneDeep(objContract);
+				delete objContractForPeer.cosigners;
+				device.sendMessageToDevice(objContract.peer_device_address, "arbiter_contract_offer", objContractForPeer);
+				if (cb) {
+					cb(objContract);
+				}
+		});
+	});
+}
+
+function getByHash(hash, cb) {
+	db.query("SELECT * FROM wallet_arbiter_contracts WHERE hash=?", [hash], function(rows){
+		if (!rows.length) {
+			return cb(null);
+		}
+		var contract = rows[0];
+		cb(decodeRow(contract));			
+	});
+}
+function getBySharedAddress(address, cb) {
+	db.query("SELECT * FROM wallet_arbiter_contracts WHERE shared_address=?", [address], function(rows){
+		if (!rows.length) {
+			return cb(null);
+		}
+		var contract = rows[0];
+		cb(decodeRow(contract));
+	});
+}
+
+function getAllByStatus(status, cb) {
+	db.query("SELECT * FROM wallet_arbiter_contracts WHERE status IN (?) ORDER BY creation_date DESC", [status], function(rows){
+		rows.forEach(decodeRow);
+		cb(rows);
+	});
+}
+
+function getAllByArbiterAddress(address, cb) {
+	db.query("SELECT * FROM wallet_arbiter_contracts WHERE arbiter_address IN (?) ORDER BY creation_date DESC", [address], function(rows){
+		rows.forEach(decodeRow);
+		cb(rows);
+	});
+}
+
+function getAllByPeerAddress(address, cb) {
+	db.query("SELECT * FROM wallet_arbiter_contracts WHERE peer_address IN (?) ORDER BY creation_date DESC", [address], function(rows){
+		rows.forEach(decodeRow);
+		cb(rows);
+	});
+}
+
+function setField(hash, field, value, cb, skipSharing) {
+	if (!["status", "shared_address", "unit", "my_contact_info", "peer_contact_info", "peer_pairing_code", "resolution_unit", "cosigners"].includes(field)) {
+		throw new Error("wrong field for setField method");
+	}
+	db.query("UPDATE wallet_arbiter_contracts SET " + field + "=? WHERE hash=?", [value, hash], function(res) {
+		if (!skipSharing)
+			shareUpdateToCosigners(hash, field);
+		if (cb) {
+			getByHash(hash, cb);
+		}
+	});
+}
+
+function store(objContract, bFromCosigner, cb) { // contracts shared by cosigners are trusted to reflect their true status
+	const me_is_cosigner = bFromCosigner ? 1 : 0;
+	const status = bFromCosigner ? (objContract.status || status_PENDING) : status_PENDING;
+	var fields = "(hash, peer_address, peer_device_address, my_address, arbiter_address, me_is_payer, my_party_name, peer_party_name, amount, asset, is_incoming, creation_date, ttl, status, title, text, peer_pairing_code, peer_contact_info, my_pairing_code, my_contact_info, me_is_cosigner";
+	var placeholders = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?";
+	var values = [objContract.hash, objContract.peer_address, objContract.peer_device_address, objContract.my_address, objContract.arbiter_address, objContract.me_is_payer ? 1 : 0, objContract.my_party_name, objContract.peer_party_name, objContract.amount, objContract.asset, 1, objContract.creation_date, objContract.ttl, status, objContract.title, objContract.text, objContract.peer_pairing_code, objContract.peer_contact_info, objContract.my_pairing_code, objContract.my_contact_info, me_is_cosigner];
+	if (bFromCosigner) {
+		if (objContract.shared_address) {
+			fields += ", shared_address";
+			placeholders += ", ?";
+			values.push(objContract.shared_address);
+		}
+		if (objContract.unit) {
+			fields += ", unit";
+			placeholders += ", ?";
+			values.push(objContract.unit);
+		}
+	}
+	fields += ")";
+	placeholders += ")";
+	db.query("INSERT "+db.getIgnore()+" INTO wallet_arbiter_contracts "+fields+" VALUES "+placeholders, values, function(res) {
+		if (cb) {
+			cb(res);
+		}
+	});
+}
+
+function respond(hash, status, signedMessageBase64, signer, cb) {
+	cb = cb || function(){};
+	getByHash(hash, function(objContract){
+		if (objContract.status !== "pending" && objContract.status !== "accepted")
+			return cb("contract is in non-applicable status");
+		var send = function(authors, pairing_code) {
+			var response = {hash: objContract.hash, status: status, signed_message: signedMessageBase64, my_contact_info: objContract.my_contact_info};
+			if (authors) {
+				response.authors = authors;
+			}
+			if (pairing_code) {
+				response.my_pairing_code = pairing_code;
+			}
+			device.sendMessageToDevice(objContract.peer_device_address, "arbiter_contract_response", response);
+
+			setField(objContract.hash, "status", status, function(objContract) {
+				if (status === "accepted") {
+					shareContractToCosigners(objContract.hash);
+				};
+				cb(null, objContract);
+			});
+		};
+		if (status === "accepted") {
+			device.getOrGeneratePermanentPairingInfo(function(pairingInfo){
+				var pairing_code = pairingInfo.device_pubkey + "@" + pairingInfo.hub + "#" + pairingInfo.pairing_secret;
+				setField(objContract.hash, "my_pairing_code", pairing_code);
+				composer.composeAuthorsAndMciForAddresses(db, [objContract.my_address], signer, function(err, authors) {
+					if (err) {
+						return cb(err);
+					}
+					send(authors, pairing_code);
+				});
+			});
+		} else {
+			send();
+		}
+	});
+}
+
+function revoke(hash, cb) {
+	getByHash(hash, function(objContract){
+		if (objContract.status !== "pending")
+			return cb("contract is in non-applicable status");
+		setField(objContract.hash, "status", "revoked", function(objContract) {
+			shareUpdateToPeer(objContract.hash, "status");
+			cb(null, objContract);
+		});
+	});
+}
+
+function shareContractToCosigners(hash) {
+	getByHash(hash, function(objContract){
+		getAllMyCosigners(hash, function(cosigners) {
+			cosigners.forEach(function(device_address) {
+				device.sendMessageToDevice(device_address, "arbiter_contract_shared", objContract);
+			});
+		});
+	});
+}
+
+function shareUpdateToCosigners(hash, field) {
+	getByHash(hash, function(objContract){
+		getAllMyCosigners(hash, function(cosigners) {
+			cosigners.forEach(function(device_address) {
+				device.sendMessageToDevice(device_address, "arbiter_contract_update", {hash: objContract.hash, field: field, value: objContract[field]});
+			});
+		});
+	});
+}
+
+function shareUpdateToPeer(hash, field) {
+	getByHash(hash, function(objContract){
+		device.sendMessageToDevice(objContract.peer_device_address, "arbiter_contract_update", {hash: objContract.hash, field: field, value: objContract[field]});
+	});
+}
+
+function getHashSrc(contract) {
+	const payer_name = contract.me_is_payer ? contract.my_party_name : contract.peer_party_name;
+	const payee_name = contract.me_is_payer ? contract.peer_party_name : contract.my_party_name;
+	const payer_address = contract.me_is_payer ? contract.my_address : contract.peer_address;
+	const payee_address = contract.me_is_payer ? contract.peer_address : contract.my_address;
+	const src = contract.creation_date > exports.NEW_HASH_DATE
+		 ? [contract.title, contract.text, contract.creation_date, payer_address, payer_name || '', contract.arbiter_address, payee_address, payee_name || '', contract.amount, contract.asset || 'null'].join(exports.DELIMITER)
+		 : [contract.title, contract.text, contract.creation_date, payer_name || '', contract.arbiter_address, payee_name || '', contract.amount, contract.asset || 'null'].join("");
+	return src;
+}
+
+function getHash(contract) {
+	return crypto.createHash("sha256").update(getHashSrc(contract), "utf8").digest("base64");
+}
+
+function getContactsHash(contract) {
+	const payer_pairing_code = contract.me_is_payer ? contract.my_pairing_code : contract.peer_pairing_code;
+	const payee_pairing_code = contract.me_is_payer ? contract.peer_pairing_code : contract.my_pairing_code;
+	const payer_contact_info = contract.me_is_payer ? contract.my_contact_info : contract.peer_contact_info;
+	const payee_contact_info = contract.me_is_payer ? contract.peer_contact_info : contract.my_contact_info;
+	const src = [payer_contact_info || '', payer_pairing_code || '', payee_contact_info || '', payee_pairing_code || ''].join("|");
+	return crypto.createHash("sha256").update(src, "utf8").digest("base64");
+}
+
+function decodeRow(row) {
+	if (row.cosigners)
+		row.cosigners = JSON.parse(row.cosigners);
+	if (row.creation_date)
+		row.creation_date_obj = new Date(row.creation_date.replace(" ", "T")+".000Z");
+	if (row.contract_content)
+		row.contract_content = JSON.parse(row.contract_content);
+	return row;
+}
+
+function getArbstoreAddresses(arbiter_address, cb) {
+	device.requestFromHub("hub/get_arbstore_url", arbiter_address, function(err, url){
+		if (err)
+			return cb(err);
+		device.requestFromHub("hub/get_arbstore_address", arbiter_address, function(err, arbstore_address){
+			if (err) {
+				return cb(err);
+			}
+			httpRequest(url, "/api/get_device_address", "", function(err, arbstore_device_address) {
+				if (err) {
+					console.warn("no arbstore_device_address", err);
+					return cb(err);
+				}
+				cb(null, { arbstore_address, arbstore_device_address });
+			});
+		});
+	});
+}
+
+function fillArbstoreAddresses(objContract, cb) {
+	if (!cb)
+		return new Promise(resolve => fillArbstoreAddresses(objContract, resolve));
+	if (objContract.arbstore_device_address && objContract.arbstore_address)
+		return cb();
+	getArbstoreAddresses(objContract.arbiter_address, function(err, result) {
+		if (err)
+			return cb(err);
+		var { arbstore_address, arbstore_device_address } = result;
+		objContract.arbstore_address = arbstore_address;
+		objContract.arbstore_device_address = arbstore_device_address;
+		db.query("UPDATE wallet_arbiter_contracts SET arbstore_address=?, arbstore_device_address=? WHERE hash=?", [arbstore_address, arbstore_device_address, objContract.hash], function () { cb(); });
+	});
+}
+
+function openDispute(hash, cb) {
+	getByHash(hash, function(objContract){
+		if (!["paid", "in_dispute"].includes(objContract.status))
+			return cb("contract can't be disputed");
+		device.requestFromHub("hub/get_arbstore_url", objContract.arbiter_address, function(err, url){
+			if (err)
+				return cb(err);
+			arbiters.getInfo(objContract.arbiter_address, async function(err, objArbiter) {
+				if (err)
+					return cb(err);
+				err = await fillArbstoreAddresses(objContract);
+				if (err)
+					return cb(err);
+				device.getOrGeneratePermanentPairingInfo(function(pairingInfo){
+					var my_pairing_code = pairingInfo.device_pubkey + "@" + pairingInfo.hub + "#" + pairingInfo.pairing_secret;
+					var data = {
+						contract_hash: hash,
+						unit: objContract.unit,
+						my_address: objContract.my_address,
+						peer_address: objContract.peer_address,
+						me_is_payer: objContract.me_is_payer,
+						my_pairing_code: objContract.my_pairing_code,
+						peer_pairing_code: objContract.peer_pairing_code,
+						encrypted_contract: device.createEncryptedPackage({
+							title: objContract.title,
+							text: objContract.text,
+							creation_date: objContract.creation_date,
+							plaintiff_party_name: objContract.my_party_name,
+							respondent_party_name: objContract.peer_party_name,
+							my_contact_info: objContract.my_contact_info,
+							peer_contact_info: objContract.peer_contact_info,
+						}, objArbiter.device_pub_key),
+						my_contact_info: objContract.my_contact_info,
+						peer_contact_info: objContract.peer_contact_info
+					};
+					db.query("SELECT 1 FROM assets WHERE unit IN(?) AND is_private=1 LIMIT 1", [objContract.asset], function(rows){
+						if (rows.length > 0) {
+							data.asset = objContract.asset;
+							data.amount = objContract.amount;
+						}
+						var dataJSON = JSON.stringify(data);
+						httpRequest(url, "/api/dispute/new", dataJSON, function(err, resp) {
+							if (err)
+								return cb(err);
+
+							setField(hash, "status", "in_dispute", function(objContract) {
+								shareUpdateToPeer(hash, "status");
+								// listen for arbiter response
+								db.query("INSERT "+db.getIgnore()+" INTO my_watched_addresses (address) VALUES (?)", [objContract.arbiter_address]);
+								cb(null, resp, objContract);
+							});
+						});
+					});
+				});
+			});
+		});
+	});
+}
+
+function appeal(hash, cb) {
+	getByHash(hash, function(objContract){
+		if (objContract.status !== "dispute_resolved")
+			return cb("contract can't be appealed");
+		var command = "hub/get_arbstore_url";
+		var address = objContract.arbiter_address;
+		if (objContract.arbstore_address) {
+			command = "hub/get_arbstore_url_by_address";
+			address = objContract.arbstore_address;
+		}
+		device.requestFromHub(command, address, async function(err, url){
+			if (err)
+				return cb("can't get arbstore url:", err);
+			err = await fillArbstoreAddresses(objContract);
+			if (err)
+				return cb(err);
+			device.getOrGeneratePermanentPairingInfo(function(pairingInfo){
+				var my_pairing_code = pairingInfo.device_pubkey + "@" + pairingInfo.hub + "#" + pairingInfo.pairing_secret;
+				var data = JSON.stringify({
+					contract_hash: hash,
+					my_pairing_code: objContract.my_pairing_code,
+					my_address: objContract.my_address,
+					contract: {title: objContract.title, text: objContract.text, creation_date: objContract.creation_date, me_is_payer: objContract.me_is_payer, my_address: objContract.my_address, peer_address: objContract.peer_address, my_party_name: objContract.my_party_name, peer_party_name: objContract.peer_party_name, arbiter_address: objContract.arbiter_address, amount: objContract.amount, asset: objContract.asset},
+				});
+				httpRequest(url, "/api/appeal/new", data, function(err, resp) {
+					if (err)
+						return cb(err);
+					setField(hash, "status", "in_appeal", function(objContract) {
+						cb(null, resp, objContract);
+					});
+				});
+			});
+		});
+	});
+}
+
+function getAppealFee(hash, cb) {
+	getByHash(hash, function(objContract){
+		var command = "hub/get_arbstore_url";
+		var address = objContract.arbiter_address;
+		if (objContract.arbstore_address) {
+			command = "hub/get_arbstore_url_by_address";
+			address = objContract.arbstore_address;
+		}
+		device.requestFromHub(command, address, function(err, url){
+			if (err)
+				return cb("can't get arbstore url:", err);
+			httpRequest(url, "/api/get_appeal_fee", "", function(err, resp) {
+				if (err)
+					return cb(err);
+				cb(null, resp);
+			});
+		});
+	});
+}
+
+function httpRequest(host, path, data, cb) {
+	var reqParams = Object.assign(url.parse(host),
+		{
+			path: path,
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"Content-Length": (new TextEncoder().encode(data)).length
+			}
+		}
+	);
+	var req = http.request(
+		reqParams,
+		function(resp){
+			var data = "";
+			resp.on("data", function(chunk){
+				data += chunk;
+			});
+			resp.on("end", function(){
+				try {
+					data = JSON.parse(data);
+					if (data.error) {
+						return cb(data.error);
+					}
+					cb(null, data);
+				} catch (e) {
+					cb(e);
+				}
+			});
+		}).on("error", cb);
+	req.write(data);
+	req.end();
+}
+
+function getDisputeByContractHash(hash, cb) {
+	db.query("SELECT * FROM arbiter_disputes WHERE contract_hash=?", [hash], function(rows){
+		if (!rows.length) {
+			return cb(null);
+		}
+		var contract = rows[0];
+		cb(decodeRow(contract));
+	});
+}
+
+function insertDispute(objDispute, cb) {
+	db.query("INSERT INTO arbiter_disputes (contract_hash,plaintiff_address,respondent_address,plaintiff_is_payer,plaintiff_pairing_code,\n\
+					respondent_pairing_code,contract_content,contract_unit,amount,asset,arbiter_address,service_fee_asset,arbstore_device_address,\n\
+					plaintiff_contact_info,respondent_contact_info)\n\
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [objDispute.contract_hash,objDispute.my_address,objDispute.peer_address,objDispute.me_is_payer,
+			objDispute.my_pairing_code,objDispute.peer_pairing_code,JSON.stringify(objDispute.contract_content),objDispute.unit,objDispute.amount,objDispute.asset,objDispute.arbiter_address,
+			objDispute.service_fee_asset,objDispute.arbstore_device_address,objDispute.my_contact_info,objDispute.peer_contact_info], function(res) {
+				cb(res);
+		}
+	);
+}
+
+function getDisputesByArbstore(arbstore_device_address, cb) {
+	db.query("SELECT * FROM arbiter_disputes WHERE arbstore_device_address=? ORDER BY creation_date DESC", [arbstore_device_address], function(rows){
+		rows.forEach(decodeRow);
+		cb(rows);
+	});
+}
+
+function getAllMyCosigners(hash, cb) {
+	db.query("SELECT device_address FROM wallet_signing_paths \n\
+		JOIN my_addresses AS ma USING(wallet)\n\
+		JOIN wallet_arbiter_contracts AS wac ON wac.my_address=ma.address\n\
+		WHERE wac.hash=?", [hash], function(rows) {
+			var cosigners = [];
+			rows.forEach(function(row) {
+				if (row.device_address !== device.getMyDeviceAddress())
+					cosigners.push(row.device_address);
+			});
+			cb(cosigners);
+		});
+}
+
+function deriveSharedAddress(hash, bOfferor, cb) {
+	getByHash(hash, function (contract) {
+		const offeror_address = bOfferor ? contract.my_address : contract.peer_address;
+		const acceptor_address = bOfferor ? contract.peer_address : contract.my_address;
+		const offeror_is_payer = bOfferor ? contract.me_is_payer : !contract.me_is_payer;
+		const offeror_device_address = bOfferor ? device.getMyDeviceAddress() : contract.peer_device_address;
+		const acceptor_device_address = bOfferor ? contract.peer_device_address : device.getMyDeviceAddress();
+		arbiters.getArbstoreInfo(contract.arbiter_address, function(err, arbstoreInfo) {
+			if (err)
+				return cb(err);
+			storage.readAssetInfo(db, contract.asset, function (assetInfo) {
+				var arrDefinition =
+					["or", [
+						["and", [
+							["address", offeror_address],
+							["address", acceptor_address]
+						]],
+						[], // placeholders [1][1]
+						[],	// placeholders [1][2]
+						["and", [
+							["address", offeror_address],
+							["in data feed", [[contract.arbiter_address], "CONTRACT_" + contract.hash, "=", offeror_address]]
+						]],
+						["and", [
+							["address", acceptor_address],
+							["in data feed", [[contract.arbiter_address], "CONTRACT_" + contract.hash, "=", acceptor_address]]
+						]]
+					]];
+				var isPrivate = assetInfo && assetInfo.is_private;
+				var isFixedDen = assetInfo && assetInfo.fixed_denominations;
+				var hasArbStoreCut = arbstoreInfo.cut > 0;
+				if (isPrivate) { // private asset
+					arrDefinition[1][1] = ["and", [
+						["address", offeror_address],
+						["in data feed", [[acceptor_address], "CONTRACT_DONE_" + contract.hash, "=", offeror_address]]
+					]];
+					arrDefinition[1][2] = ["and", [
+						["address", acceptor_address],
+						["in data feed", [[offeror_address], "CONTRACT_DONE_" + contract.hash, "=", acceptor_address]]
+					]];
+				} else {
+					arrDefinition[1][1] = ["and", [
+						["address", offeror_address],
+						["has", {
+							what: "output",
+							asset: contract.asset || "base",
+							amount: offeror_is_payer && !isFixedDen && hasArbStoreCut ? Math.floor(contract.amount * (1 - arbstoreInfo.cut)) : contract.amount,
+							address: acceptor_address
+						}]
+					]];
+					arrDefinition[1][2] = ["and", [
+						["address", acceptor_address],
+						["has", {
+							what: "output",
+							asset: contract.asset || "base",
+							amount: offeror_is_payer || isFixedDen || !hasArbStoreCut ? contract.amount : Math.floor(contract.amount * (1 - arbstoreInfo.cut)),
+							address: offeror_address
+						}]
+					]];
+					if (!isFixedDen && hasArbStoreCut) {
+						arrDefinition[1][offeror_is_payer ? 1 : 2][1].push(
+							["has", {
+								what: "output",
+								asset: contract.asset || "base",
+								amount: contract.amount - Math.floor(contract.amount * (1 - arbstoreInfo.cut)),
+								address: arbstoreInfo.address
+							}]
+						);
+					}
+					// protect against combining several contracts in a single transaction (if their parties, amounts, and assets are identical, the 'has what' above would satisfy both contracts, allowing the attacker to send the change to themselves)
+					arrDefinition[1][1][1].push(
+						["not", ["has", {
+							what: "input",
+							asset: contract.asset || "base",
+							address: "other address",
+						}]]
+					);
+					arrDefinition[1][2][1].push(
+						["not", ["has", {
+							what: "input",
+							asset: contract.asset || "base",
+							address: "other address",
+						}]]
+					);
+				}
+				var assocSignersByPath = {
+					"r.0.0": {
+						address: offeror_address,
+						member_signing_path: "r",
+						device_address: offeror_device_address
+					},
+					"r.0.1": {
+						address: acceptor_address,
+						member_signing_path: "r",
+						device_address: acceptor_device_address
+					},
+					"r.1.0": {
+						address: offeror_address,
+						member_signing_path: "r",
+						device_address: offeror_device_address
+					},
+					"r.2.0": {
+						address: acceptor_address,
+						member_signing_path: "r",
+						device_address: acceptor_device_address
+					},
+					"r.3.0": {
+						address: offeror_address,
+						member_signing_path: "r",
+						device_address: offeror_device_address
+					},
+					"r.4.0": {
+						address: acceptor_address,
+						member_signing_path: "r",
+						device_address: acceptor_device_address
+					},
+				};
+				cb(null, arrDefinition, assocSignersByPath);
+			});
+		});
+	});
+}
+
+// walletInstance should have "sendMultiPayment" function with appropriate signer inside
+function createSharedAddressAndPostUnit(hash, walletInstance, cb) {
+	deriveSharedAddress(hash, true, function(err, arrDefinition, assocSignersByPath) {
+		if (err)
+			return cb(err);
+		require("./wallet_defined_by_addresses.js").createNewSharedAddress(arrDefinition, assocSignersByPath, {
+			ifError: function(err){
+				cb(err);
+			},
+			ifOk: function(shared_address){
+				setField(hash, "shared_address", shared_address, async function(contract) {
+					const err = await fillArbstoreAddresses(contract);
+					if (err)
+						return cb(err);
+					// share this contract to my cosigners for them to show proper ask dialog
+					shareContractToCosigners(contract.hash);
+					shareUpdateToPeer(contract.hash, "shared_address");
+
+					const contacts_hash = getContactsHash(contract);
+
+					// post a unit with contract text hash and send it for signing to correspondent
+					var value = {"contract_text_hash": contract.hash, "arbiter": contract.arbiter_address, contacts_hash};
+					var objContractMessage = {
+						app: "data",
+						payload_location: "inline",
+						payload_hash: objectHash.getBase64Hash(value, true),
+						payload: value
+					};
+
+					walletInstance.sendMultiPayment({
+						spend_unconfirmed: walletInstance.spendUnconfirmed ? 'all' : 'own',
+						asset: "base",
+						to_address: shared_address,
+						amount: exports.CHARGE_AMOUNT,
+						arrSigningDeviceAddresses: contract.cosigners.length ? contract.cosigners.concat([contract.peer_device_address, device.getMyDeviceAddress()]) : [],
+						signing_addresses: [shared_address],
+						messages: [objContractMessage]
+					}, function(err, unit) { // can take long if multisig
+						if (err)
+							return cb(err);
+
+						// set contract's unit field
+						setField(contract.hash, "unit", unit, function(contract) {
+							shareUpdateToPeer(contract.hash, "unit");
+							setField(contract.hash, "status", "signed", function(contract) {
+								cb(null, contract);
+							});
+						});
+					});
+				});
+			}
+		});
+	});
+}
+
+function handleReceivedSharedAddress(hash, shared_address, from_cosigner, retry_count = 0) {
+	console.log(`received shared address ${shared_address} for arbiter contract ${hash} from peer`);
+	db.query("SELECT 1 FROM shared_addresses WHERE shared_address=?", [shared_address], function (rows) {
+		if (rows.length === 0) {
+			if (retry_count >= 10)
+				return console.log(`shared address ${shared_address} not found in db after 10 retries, giving up`);
+			console.log(`shared address ${shared_address} not yet in db, waiting for 30 seconds and trying again`);
+			return setTimeout(handleReceivedSharedAddress, 30000, hash, shared_address, from_cosigner, retry_count + 1);
+		}
+		console.log(`shared address ${shared_address} found in db, deriving shared address definition to verify it matches the received one`);
+		deriveSharedAddress(hash, false, function (err, arrDefinition, assocSignersByPath) {
+			if (err) {
+				if (retry_count >= 10)
+					return console.log(`failed derivation of shared address ${shared_address} after 10 retries, giving up`, err);
+				console.log("error deriving shared address definition, will retry in 30 seconds", err);
+				return setTimeout(handleReceivedSharedAddress, 30000, hash, shared_address, from_cosigner, retry_count + 1);
+			}
+			const expected_shared_address = objectHash.getChash160(arrDefinition);
+			if (expected_shared_address !== shared_address)
+				return console.log(`expected shared address ${expected_shared_address} does not match received from offeror ${shared_address}`, JSON.stringify(arrDefinition, null, 2));
+			console.log(`shared address ${expected_shared_address} matches the received one, setting it to the contract and sharing with cosigners`);
+			setField(hash, "shared_address", shared_address, function (contract) {
+				eventBus.emit("arbiter_contract_update", contract, "shared_address", shared_address);
+			}, from_cosigner);
+		});
+	});
+}
+
+function handleReceivedSigningUnit(contract, unit, from_cosigner, retry_count = 0) {
+	db.query("SELECT 1 FROM unit_authors WHERE unit=? AND address=?", [unit, contract.shared_address], async function (rows) {
+		if (rows.length === 0) {
+			if (retry_count >= 10)
+				return console.log(`signing tx ${unit} not found in db after 10 retries, giving up`);
+			console.log(`signing tx ${unit} not yet in db, waiting for 30 seconds and trying again`);
+			return setTimeout(handleReceivedSigningUnit, 30000, contract, unit, from_cosigner, retry_count + 1);
+		}
+		console.log(`signing tx ${unit} found in db, setting contract's unit and status to signed`);
+		const objUnit = await storage.readUnit(unit);
+		const dataMessage = objUnit.messages.find(message => message.app === "data");
+		if (!dataMessage)
+			return console.log(`data message not found in purported signing unit ${unit}`);
+		const { payload } = dataMessage;
+		const contacts_hash = getContactsHash(contract);
+		if (payload.arbiter !== contract.arbiter_address || payload.contract_text_hash !== contract.hash || payload.contacts_hash !== contacts_hash)
+			return console.log(`data message payload does not match contract ${contract.hash} in purported signing unit ${unit}`);
+		const author = objUnit.authors.find(author => author.address === contract.shared_address);
+		const signing_paths = Object.keys(author.authentifiers);
+		const isMutuallySigned = signing_paths.find(p => p.startsWith('r.0.0')) && signing_paths.find(p => p.startsWith('r.0.1'));
+		if (!isMutuallySigned)
+			return console.log(`signing unit ${unit} is not mutually signed, authentifiers: ${JSON.stringify(author.authentifiers)}`);
+		const err = await fillArbstoreAddresses(contract);
+		if (err)
+			console.log(`failed to fill arbstore addresses for contract ${contract.hash} while handling received signing unit ${unit}`, err);
+		setField(contract.hash, "status", "signed", null, true);
+		setField(contract.hash, "unit", unit, function(contract) {
+			eventBus.emit("arbiter_contract_update", contract, "unit", unit);
+		}, from_cosigner);
+	});
+}
+
+function pay(hash, walletInstance, arrSigningDeviceAddresses, cb) {
+	getByHash(hash, function(objContract) {
+		if (!objContract.shared_address || objContract.status !== "signed" || !objContract.me_is_payer)
+			return cb("contract can't be paid");
+		var opts = {
+			asset: objContract.asset,
+			to_address: objContract.shared_address,
+			amount: objContract.amount,
+			spend_unconfirmed: walletInstance.spendUnconfirmed ? 'all' : 'own'
+		};
+		if (arrSigningDeviceAddresses.length)
+			opts.arrSigningDeviceAddresses = arrSigningDeviceAddresses;
+		walletInstance.sendMultiPayment(opts, function(err, unit){								
+			if (err)
+				return cb(err);
+			setField(objContract.hash, "status", "paid", function(objContract){
+				cb(null, objContract, unit);
+			});
+			// listen for peer announce to withdraw funds
+			storage.readAssetInfo(db, objContract.asset, function(assetInfo) {
+				if (assetInfo && assetInfo.is_private)
+					db.query("INSERT "+db.getIgnore()+" INTO my_watched_addresses (address) VALUES (?)", [objContract.peer_address]);
+			});
+		});
+	});
+}
+
+function complete(hash, walletInstance, arrSigningDeviceAddresses, cb) {
+	getByHash(hash, async function(objContract) {
+		if (objContract.status !== "paid" && objContract.status !== "in_dispute")
+			return cb("contract can't be completed");
+		const err = await fillArbstoreAddresses(objContract);
+		if (err)
+			return cb(err);
+		storage.readAssetInfo(db, objContract.asset, function(assetInfo) {
+			var opts;
+			new Promise((resolve, reject) => {
+				if (assetInfo && assetInfo.is_private) {
+					var value = {};
+					value["CONTRACT_DONE_" + objContract.hash] = objContract.peer_address;
+					opts = {
+						spend_unconfirmed: walletInstance.spendUnconfirmed ? 'all' : 'own',
+						paying_addresses: [objContract.my_address],
+						signing_addresses: [objContract.my_address],
+						change_address: objContract.my_address,
+						messages: [{
+							app: 'data_feed',
+							payload_location: "inline",
+							payload_hash: objectHash.getBase64Hash(value, true),
+							payload: value
+						}]
+					};
+					resolve();
+				} else {
+					opts = {
+						spend_unconfirmed: walletInstance.spendUnconfirmed ? 'all' : 'own',
+						paying_addresses: [objContract.shared_address],
+						change_address: objContract.shared_address,
+						asset: objContract.asset
+					};
+					if (objContract.me_is_payer && !(assetInfo && (assetInfo.fixed_denominations || assetInfo.is_private))) { // complete
+						require("./wallet_defined_by_addresses.js").readSharedAddressDefinition(objContract.shared_address, function (arrDefinition) {
+							const index = objContract.is_incoming ? 2 : 1;
+							const peer_amount = arrDefinition[1][index][1][1][1].amount;
+							const arbstore_amount = arrDefinition[1][index][1][2] && arrDefinition[1][index][1][2][0] === 'has' ? arrDefinition[1][index][1][2][1].amount : 0;
+							if (!isFinite(peer_amount) || !isFinite(arbstore_amount))
+								throw new Error("invalid amounts in shared address definition: " + JSON.stringify(arrDefinition));
+							if (peer_amount + arbstore_amount !== objContract.amount)
+								throw new Error(`amounts in shared address definition do not sum up to contract amount: ${peer_amount} + ${arbstore_amount} !== ${objContract.amount}`);
+							if (arbstore_amount > peer_amount)
+								throw new Error(`arbstore cut is more than 50% of the total amount, peer_amount: ${peer_amount}, arbstore_amount: ${arbstore_amount}`);
+							if (arbstore_amount === 0) {
+								opts.to_address = objContract.peer_address;
+								opts.amount = objContract.amount;
+							} else {
+								opts[objContract.asset && objContract.asset != "base" ? "asset_outputs" : "base_outputs"] = [
+									{ address: objContract.peer_address, amount: peer_amount},
+									{ address: objContract.arbstore_address, amount: arbstore_amount},
+								];
+							}
+							resolve();
+						});
+					} else { // refund
+						opts.to_address = objContract.peer_address;
+						opts.amount = objContract.amount;
+						resolve();
+					}
+				}
+			}).then(() => {
+				if (arrSigningDeviceAddresses.length)
+					opts.arrSigningDeviceAddresses = arrSigningDeviceAddresses;
+				walletInstance.sendMultiPayment(opts, function(err, unit){
+					if (err)
+						return cb(err);
+					var status = objContract.me_is_payer ? "completed" : "cancelled";
+					setField(objContract.hash, "status", status, function(objContract){
+						cb(null, objContract, unit);
+					});
+				});
+			}).catch(err => {
+				cb(err);
+			});
+		});
+	});
+}
+
+function parseWinnerFromUnit(contract, objUnit) {
+	if (objUnit.authors[0].address !== contract.arbiter_address) {
+		return;
+	}
+	var key = "CONTRACT_" + contract.hash;
+	var winner;
+	objUnit.messages.forEach(function(message){
+		if (message.app !== "data_feed" || !message.payload || !message.payload[key]) {
+			return;
+		}
+		winner = message.payload[key];
+	});
+	if (!winner || (winner !== contract.my_address && winner !== contract.peer_address)) {
+		return;
+	}
+	return winner;
+}
+
+
+/* ==== LISTENERS ==== */
+
+eventBus.on("arbiter_contract_update", function(objContract, field, value) {
+	// listen for arbiter response
+	if (field === 'status' && value === 'in_dispute') {
+		db.query("INSERT "+db.getIgnore()+" INTO my_watched_addresses (address) VALUES (?)", [objContract.arbiter_address]);
+	}
+});
+
+// contract payment received
+eventBus.on("new_my_transactions", function newtxs(arrNewUnits) {
+	db.query("SELECT hash, outputs.unit FROM wallet_arbiter_contracts\n\
+		JOIN outputs ON outputs.address=wallet_arbiter_contracts.shared_address\n\
+		CROSS JOIN units ON units.unit=outputs.unit\n\
+		WHERE outputs.unit IN (" + arrNewUnits.map(db.escape).join(', ') + ") AND outputs.asset IS wallet_arbiter_contracts.asset AND (wallet_arbiter_contracts.status='signed' OR wallet_arbiter_contracts.status='accepted') AND units.sequence='good'\n\
+		GROUP BY outputs.address\n\
+		HAVING SUM(outputs.amount) >= wallet_arbiter_contracts.amount", function(rows) {
+			rows.forEach(function(row) {
+				getByHash(row.hash, function(contract){
+					if (contract.status === 'accepted') { // we received payment already but did not yet receive signature unit message, wait for unit to be received
+						eventBus.on('arbiter_contract_update', function retryPaymentCheck(objContract, field, value){
+							if (objContract.hash === contract.hash && field === 'unit') {
+								newtxs(arrNewUnits);
+								eventBus.removeListener('arbiter_contract_update', retryPaymentCheck);
+							}
+						});
+						return;
+					}
+					setField(contract.hash, "status", "paid", function(objContract) {
+						eventBus.emit("arbiter_contract_update", objContract, "status", "paid", row.unit);
+						// listen for peer announce to withdraw funds
+						storage.readAssetInfo(db, contract.asset, function(assetInfo) {
+							if (assetInfo && assetInfo.is_private)
+								db.query("INSERT "+db.getIgnore()+" INTO my_watched_addresses (address) VALUES (?)", [objContract.peer_address]);
+
+						});
+					});
+				});
+			});
+	});
+});
+
+// contract completion (public asset)
+eventBus.on("new_my_transactions", function(arrNewUnits) {
+	db.query("SELECT hash, outputs.unit FROM wallet_arbiter_contracts\n\
+		JOIN outputs ON outputs.address=wallet_arbiter_contracts.my_address\n\
+		JOIN inputs ON inputs.address=wallet_arbiter_contracts.shared_address AND inputs.unit=outputs.unit\n\
+		CROSS JOIN units ON units.unit=outputs.unit\n\
+		WHERE outputs.unit IN (" + arrNewUnits.map(db.escape).join(', ') + ") AND outputs.asset IS wallet_arbiter_contracts.asset AND wallet_arbiter_contracts.status IN('paid','in_dispute') AND units.sequence='good'\n\
+		GROUP BY wallet_arbiter_contracts.hash", function(rows) {
+			rows.forEach(function(row) {
+				getByHash(row.hash, function(contract){
+					var status = contract.me_is_payer ? "cancelled" : "completed";
+					setField(contract.hash, "status", status, function(objContract) {
+						eventBus.emit("arbiter_contract_update", objContract, "status", status, row.unit);
+					});
+				});
+			});
+	});
+});
+
+// arbiter response
+eventBus.on("new_my_transactions", function(units) {
+	units.forEach(function(unit) {
+		storage.readUnit(unit, function(objUnit) {
+			var address = objUnit.authors[0].address;
+			getAllByArbiterAddress(address, function(contracts) {
+				contracts.forEach(function(objContract) {
+				//	if (objContract.status !== "in_dispute") // the peer might "forget" to send me the in_dispute status update (but we still need to start watching the arbiter's address)
+				//		return;
+					var winner = parseWinnerFromUnit(objContract, objUnit);
+					if (!winner) {
+						return;
+					}
+					var unit = objUnit.unit;
+					console.log(`arbiter resolution received for contract ${objContract.hash}, winner: ${winner}, resolution unit: ${unit}, current status: ${objContract.status}`);
+					setField(objContract.hash, "resolution_unit", unit);
+					setField(objContract.hash, "status", "dispute_resolved", function(objContract) {
+						eventBus.emit("arbiter_contract_update", objContract, "status", "dispute_resolved", unit, winner);
+					});
+				});
+			});
+		});
+	});
+});
+
+// arbiter response stabilized
+eventBus.on("my_transactions_became_stable", function(units) {
+	db.query(
+		"SELECT DISTINCT unit_authors.unit \n\
+		FROM unit_authors \n\
+		JOIN wallet_arbiter_contracts ON address=arbiter_address \n\
+		CROSS JOIN units ON units.unit=unit_authors.unit \n\
+		WHERE unit_authors.unit IN(" + units.map(db.escape).join(', ') + ") AND units.sequence='good'",
+		function (rows) {
+			units = rows.map(row => row.unit);
+			units.forEach(function(unit) {
+				storage.readUnit(unit, function(objUnit) {
+					var address = objUnit.authors[0].address;
+					getAllByArbiterAddress(address, function(contracts) {
+						var count = 0;
+						contracts.forEach(function(objContract) {
+							if (objContract.status !== "dispute_resolved" && objContract.status !== "in_dispute") // we still can be in dispute in case of light wallet stayed offline
+								return;
+							var winner = parseWinnerFromUnit(objContract, objUnit);
+							if (winner === objContract.my_address)
+								eventBus.emit("arbiter_contract_update", objContract, "resolution_unit_stabilized", null, null, winner);
+							if (objContract.status === "in_dispute")
+								count++;
+						});
+						if (count === 0)
+							wallet_general.removeWatchedAddress(address);
+					});
+				});
+			});
+		}
+	);
+});
+
+// unit with peer funds release for private assets became stable
+eventBus.on("my_transactions_became_stable", function(units) {
+	db.query(
+		"SELECT DISTINCT unit_authors.unit \n\
+		FROM unit_authors \n\
+		JOIN wallet_arbiter_contracts ON (address=peer_address OR address=my_address) \n\
+		JOIN assets ON asset=assets.unit \n\
+		JOIN units ON units.unit=unit_authors.unit \n\
+		WHERE unit_authors.unit IN(" + units.map(db.escape).join(', ') + ") AND is_private=1 AND units.sequence='good'",
+		function (rows) {
+			units = rows.map(row => row.unit);
+			units.forEach(function (unit) {
+				storage.readUnit(unit, function (objUnit) {
+					objUnit.messages.forEach(function (m) {
+						if (m.app !== "data_feed")
+							return;
+						for (let key in m.payload) {
+							const contract_hash_matches = key.match(/CONTRACT_DONE_(.+)/);
+							if (!contract_hash_matches)
+								continue;
+							const contract_hash = contract_hash_matches[1];
+							getByHash(contract_hash, function (objContract) {
+								if (!objContract)
+									return;
+								if (objContract.peer_address !== objUnit.authors[0].address)
+									return;
+								storage.readAssetInfo(db, objContract.asset, function(assetInfo) {
+									if (!assetInfo || !assetInfo.is_private)
+										return;
+									if (m.payload[key] != objContract.my_address)
+										return;
+									if (objContract.status === 'paid') {
+										const status = objContract.me_is_payer ? 'cancelled' : 'completed';
+										setField(contract_hash, 'status', status, function (objContract) {
+											eventBus.emit("arbiter_contract_update", objContract, "status", status, unit, null, true);
+											let count = 0;
+											getAllByPeerAddress(objContract.peer_address, function (contracts) {
+												contracts.forEach(function (objContract) {
+													if (objContract.status === "paid")
+														count++;
+												});
+												if (count == 0)
+													wallet_general.removeWatchedAddress(objContract.peer_address);
+											});
+										});
+									}
+								});
+							});
+						}
+					});
+				});
+			});
+		}
+	);
+});
+
+exports.createAndSend = createAndSend;
+exports.getByHash = getByHash;
+exports.getBySharedAddress = getBySharedAddress;
+exports.respond = respond;
+exports.revoke = revoke;
+exports.getAllByStatus = getAllByStatus;
+exports.setField = setField;
+exports.store = store;
+exports.getHashSrc = getHashSrc;
+exports.getHash = getHash;
+exports.getContactsHash = getContactsHash;
+exports.openDispute = openDispute;
+exports.getDisputeByContractHash = getDisputeByContractHash;
+exports.insertDispute = insertDispute;
+exports.getDisputesByArbstore = getDisputesByArbstore;
+exports.appeal = appeal;
+exports.getAppealFee = getAppealFee;
+exports.getAllByArbiterAddress = getAllByArbiterAddress;
+exports.getAllByPeerAddress = getAllByPeerAddress;
+exports.getAllMyCosigners = getAllMyCosigners;
+exports.createSharedAddressAndPostUnit = createSharedAddressAndPostUnit;
+exports.handleReceivedSharedAddress = handleReceivedSharedAddress;
+exports.handleReceivedSigningUnit = handleReceivedSigningUnit;
+exports.shareUpdateToPeer = shareUpdateToPeer;
+exports.pay = pay;
+exports.complete = complete;
+exports.parseWinnerFromUnit = parseWinnerFromUnit;

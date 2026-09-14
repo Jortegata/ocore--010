@@ -1,0 +1,322 @@
+/*jslint node: true */
+"use strict";
+var async = require('async');
+var db = require('./db.js');
+var constants = require('./constants.js');
+var conf = require('./conf.js');
+var string_utils = require("./string_utils.js");
+var objectHash = require('./object_hash.js');
+var ecdsaSig = require('./signature.js');
+var _ = require('lodash');
+var storage = require('./storage.js');
+var composer = require('./composer.js');
+var Definition = require("./definition.js");
+var ValidationUtils = require("./validation_utils.js");
+var eventBus = require("./event_bus.js");
+
+
+function repeatString(str, times){
+	if (str.repeat)
+		return str.repeat(times);
+	return (new Array(times+1)).join(str);
+}
+
+
+
+
+// with bNetworkAware=true, last_ball_unit is added, the definition is taken at this point, and the definition is added only if necessary
+function signMessage(message, from_address, signer, bNetworkAware, handleResult){
+	if (typeof bNetworkAware === 'function') {
+		handleResult = bNetworkAware;
+		bNetworkAware = false;
+	}
+	var objAuthor = {
+		address: from_address,
+		authentifiers: {}
+	};
+	var objUnit = {
+		version: constants.version,
+		signed_message: message,
+		authors: [objAuthor]
+	};
+	
+	function setDefinitionAndLastBallUnit(cb) {
+		if (bNetworkAware) {
+			composer.composeAuthorsAndMciForAddresses(db, [from_address], signer, function (err, authors, last_ball_unit) {
+				if (err)
+					return handleResult(err);
+				objUnit.authors = authors;
+				objUnit.last_ball_unit = last_ball_unit;
+				cb();
+			});
+		}
+		else {
+			signer.readDefinition(db, from_address, function (err, arrDefinition) {
+				if (err)
+					throw Error("signMessage: can't read definition: " + err);
+				objAuthor.definition = arrDefinition;
+				cb();
+			});
+		}
+	}
+
+	var assocSigningPaths = {};
+	signer.readSigningPaths(db, from_address, function(assocLengthsBySigningPaths){
+		var arrSigningPaths = Object.keys(assocLengthsBySigningPaths);
+		assocSigningPaths[from_address] = arrSigningPaths;
+		for (var j=0; j<arrSigningPaths.length; j++)
+			objAuthor.authentifiers[arrSigningPaths[j]] = repeatString("-", assocLengthsBySigningPaths[arrSigningPaths[j]]);
+		setDefinitionAndLastBallUnit(function(){
+			var text_to_sign = objectHash.getSignedPackageHashToSign(objUnit);
+			async.each(
+				objUnit.authors,
+				function(author, cb2){
+					var address = author.address;
+					async.each( // different keys sign in parallel (if multisig)
+						assocSigningPaths[address],
+						function(path, cb3){
+							if (signer.sign){
+								signer.sign(objUnit, {}, address, path, function(err, signature){
+									if (err)
+										return cb3(err);
+									// it can't be accidentally confused with real signature as there are no [ and ] in base64 alphabet
+									if (signature === '[refused]')
+										return cb3('one of the cosigners refused to sign');
+									author.authentifiers[path] = signature;
+									cb3();
+								});
+							}
+							else{
+								signer.readPrivateKey(address, path, function(err, privKey){
+									if (err)
+										return cb3(err);
+									author.authentifiers[path] = ecdsaSig.sign(text_to_sign, privKey);
+									cb3();
+								});
+							}
+						},
+						function(err){
+							cb2(err);
+						}
+					);
+				},
+				function(err){
+					if (err)
+						return handleResult(err);
+					console.log(require('util').inspect(objUnit, {depth:null}));
+					handleResult(null, objUnit);
+				}
+			);
+		});
+	});
+}
+
+
+
+
+function validateSignedMessage(conn, objSignedMessage, address, mci, handleResult) {
+	if (!handleResult) {
+		if (mci) { // validateSignedMessage(conn, objSignedMessage, address, handleResult)
+			handleResult = mci;
+			mci = undefined;
+		}
+		else { // validateSignedMessage(objSignedMessage, handleResult)
+			handleResult = objSignedMessage;
+			objSignedMessage = conn;
+			conn = db;
+		}
+	}
+	const max_complexity = (mci >= constants.pemCurvesFixMci) ? 10 : 0;
+	if (!ValidationUtils.isNonemptyObject(objSignedMessage))
+		return handleResult("signed message must be a non-empty object");
+	if (ValidationUtils.hasFieldsExcept(objSignedMessage, ["signed_message", "authors", "last_ball_unit", "timestamp", "version"]))
+		return handleResult("unknown fields");
+	if (!('signed_message' in objSignedMessage))
+		return handleResult("no signed message");
+	if ("version" in objSignedMessage && constants.supported_versions.indexOf(objSignedMessage.version) === -1)
+		return handleResult("unsupported version: " + JSON.stringify(objSignedMessage.version));
+	var authors = objSignedMessage.authors;
+	if (!ValidationUtils.isNonemptyArray(authors))
+		return handleResult("no authors");
+	if (!address && !ValidationUtils.isArrayOfLength(authors, 1))
+		return handleResult("authors not an array of len 1");
+	if (authors.length > constants.MAX_AUTHORS_PER_UNIT)
+		return handleResult("too many authors");
+	var prev_address = "";
+	var the_author;
+	for (var i = 0; i < authors.length; i++){
+		var author = authors[i];
+		if (!ValidationUtils.isNonemptyObject(author))
+			return handleResult("author must be a non-empty object");
+		if (!ValidationUtils.isValidAddress(author.address))
+			return handleResult("not valid address");
+		if (author.address <= prev_address)
+			return handleResult("author addresses not sorted");
+		prev_address = author.address;
+		if (ValidationUtils.hasFieldsExcept(author, ['address', 'definition', 'authentifiers']))
+			return handleResult("foreign fields in author");
+		if ("definition" in author) {
+			if (!ValidationUtils.isArrayOfLength(author.definition, 2))
+				return handleResult("definition must be an array of length 2");
+			if (author.definition[0] === 'autonomous agent')
+				return handleResult('AA cannot be defined in authors');
+			try {
+				if (objectHash.getChash160(author.definition) !== author.address)
+					return handleResult("wrong definition: " + objectHash.getChash160(author.definition) + "!==" + author.address);
+			}
+			catch (e) {
+				return handleResult("failed to calc address definition hash: " + e);
+			}
+		}
+		if (author.address === address)
+			the_author = author;
+		if (!ValidationUtils.isNonemptyObject(author.authentifiers))
+			return handleResult("no authentifiers");
+		for (let path in author.authentifiers) {
+			if (!ValidationUtils.isNonemptyString(author.authentifiers[path]))
+				return handleResult("authentifiers must be nonempty strings");
+			if (author.authentifiers[path].length > constants.MAX_AUTHENTIFIER_LENGTH)
+				return handleResult("authentifier too long");
+		}
+	}
+	if (!the_author) {
+		if (address)
+			return handleResult("not signed by the expected address");
+		the_author = authors[0];
+	}
+	try { // check for nulls and empty objects, this makes getChash160 safe on all authors, not just the signer
+		string_utils.getJsonSourceString(objSignedMessage);
+	}
+	catch (e) {
+		return handleResult("invalid signed message: " + e);
+	}
+	var bNetworkAware = ("last_ball_unit" in objSignedMessage);
+	if (bNetworkAware && !ValidationUtils.isValidBase64(objSignedMessage.last_ball_unit, constants.HASH_LENGTH))
+		return handleResult("invalid last_ball_unit");
+	
+	function validateOrReadDefinition(objAuthor, cb, bRetrying) {
+		var bHasDefinition = ("definition" in objAuthor);
+		if (bNetworkAware) {
+			conn.query("SELECT main_chain_index, timestamp FROM units WHERE unit=?", [objSignedMessage.last_ball_unit], function (rows) {
+				if (rows.length === 0) {
+					var network = require('./network.js');
+					if (!conf.bLight && !network.isCatchingUp() || bRetrying)
+						return handleResult("last_ball_unit " + objSignedMessage.last_ball_unit + " not found");
+					if (conf.bLight)
+						network.requestHistoryFor([objSignedMessage.last_ball_unit], [objAuthor.address], function () {
+							validateOrReadDefinition(objAuthor, cb, true);
+						});
+					else
+						eventBus.once('catching_up_done', function () {
+							// no retry flag, will retry multiple times until the catchup is over
+							validateOrReadDefinition(objAuthor, cb);
+						});
+					return;
+				}
+				bRetrying = false;
+				var last_ball_mci = rows[0].main_chain_index;
+				var last_ball_timestamp = rows[0].timestamp;
+				storage.readDefinitionByAddress(conn, objAuthor.address, last_ball_mci, {
+					ifDefinitionNotFound: function (definition_chash) { // first use of the definition_chash (in particular, of the address, when definition_chash=address)
+						if (!bHasDefinition) {
+							if (!conf.bLight || bRetrying)
+								return handleResult("definition expected but not provided");
+							var network = require('./network.js');
+							return network.requestHistoryFor([], [objAuthor.address], function () {
+								validateOrReadDefinition(objAuthor, cb, true);
+							});
+						}
+						if (objectHash.getChash160(objAuthor.definition) !== definition_chash)
+							return handleResult("wrong definition: "+objectHash.getChash160(objAuthor.definition) +"!=="+ definition_chash);
+						cb(objAuthor.definition, last_ball_mci, last_ball_timestamp);
+					},
+					ifFound: function (arrAddressDefinition) {
+						if (bHasDefinition)
+							return handleResult("should not include definition");
+						cb(arrAddressDefinition, last_ball_mci, last_ball_timestamp);
+					}
+				});
+			});
+		}
+		else {
+			if (!bHasDefinition)
+				return handleResult("no definition");
+			try {
+				if (objectHash.getChash160(objAuthor.definition) !== objAuthor.address)
+					return handleResult("wrong definition: " + objectHash.getChash160(objAuthor.definition) + "!==" + objAuthor.address);
+			} catch (e) {
+				return handleResult("failed to calc address definition hash: " + e);
+			}
+			// no last_ball_unit of its own; before the fix, always behave as before (-1) to keep old units re-evaluating the same way
+			cb(objAuthor.definition, (mci >= constants.pemCurvesFixMci) ? mci : -1, 0);
+		}
+	}
+
+	let last_ball_mci;
+	let complexity = 0;
+	async.eachSeries(
+		authors,
+		function (objAuthor, cb) {
+			validateOrReadDefinition(objAuthor, function (arrAddressDefinition, _last_ball_mci, last_ball_timestamp) {
+				last_ball_mci = _last_ball_mci;
+				var objUnit = _.clone(objSignedMessage);
+				objUnit.messages = []; // some ops need it
+				try {
+					var objValidationState = {
+						unit_hash_to_sign: objectHash.getSignedPackageHashToSign(objSignedMessage),
+						last_ball_mci: last_ball_mci,
+						last_ball_timestamp: last_ball_timestamp,
+						bNoReferences: !bNetworkAware,
+						complexity,
+						max_complexity,
+					};
+				}
+				catch (e) {
+					return cb("failed to calc unit_hash_to_sign: " + e);
+				}
+				try {
+					// passing db as null
+					Definition.validateAuthentifiers(
+						conn, objAuthor.address, null, arrAddressDefinition, objUnit, objValidationState, objAuthor.authentifiers,
+						function (err, res) {
+							if (err) // error in address definition
+								return cb(err);
+							if (!res) // wrong signature or the like
+								return cb("authentifier verification failed");
+							complexity = objValidationState.complexity;
+							cb();
+						}
+					);
+				}
+				catch (e) {
+					console.log("exception while validating signed message:", e);
+					return cb("exception while validating: " + e);
+				}
+			});
+		},
+		function (err) {
+			if (err)
+				return handleResult(err);
+			handleResult(null, last_ball_mci);
+		}
+	);
+}
+
+// inconsistent for multisig addresses
+function validateSignedMessageSync(objSignedMessage){
+	var err;
+	var bCalledBack = false;
+	validateSignedMessage(objSignedMessage, function(_err){
+		err = _err;
+		bCalledBack = true;
+	});
+	if (!bCalledBack)
+		throw Error("validateSignedMessage is not sync");
+	return err;
+}
+
+
+
+exports.signMessage = signMessage;
+exports.validateSignedMessage = validateSignedMessage;
+exports.validateSignedMessageSync = validateSignedMessageSync;

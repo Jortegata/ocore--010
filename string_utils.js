@@ -1,0 +1,435 @@
+/*jslint node: true */
+"use strict";
+
+var STRING_JOIN_CHAR = "\x00";
+
+/**
+ * Converts the argument into a string by mapping data types to a prefixed string and concatenating all fields together.
+ * @param obj the value to be converted into a string
+ * @returns {string} the string version of the value
+ */
+function getSourceString(obj) {
+	var arrComponents = [];
+	function extractComponents(variable){
+		if (variable === null)
+			throw Error("null value in "+JSON.stringify(obj));
+		switch (typeof variable){
+			case "string":
+				if (variable.includes(STRING_JOIN_CHAR))
+					throw Error("00 byte in string value in " + JSON.stringify(obj));
+				arrComponents.push("s", variable);
+				break;
+			case "number":
+				if (!isFinite(variable))
+					throw Error("invalid number: " + variable);
+				arrComponents.push("n", variable.toString());
+				break;
+			case "boolean":
+				arrComponents.push("b", variable.toString());
+				break;
+			case "object":
+				if (Array.isArray(variable)){
+					if (variable.length === 0)
+						throw Error("empty array in "+JSON.stringify(obj));
+					arrComponents.push('[');
+					for (var i=0; i<variable.length; i++)
+						extractComponents(variable[i]);
+					arrComponents.push(']');
+				}
+				else{
+					var keys = Object.keys(variable).sort();
+					if (keys.length === 0)
+						throw Error("empty object in "+JSON.stringify(obj));
+					keys.forEach(function(key){
+						if (typeof variable[key] === "undefined")
+							throw Error("undefined at "+key+" of "+JSON.stringify(obj));
+						if (key.includes(STRING_JOIN_CHAR))
+							throw Error("00 byte in object key in " + JSON.stringify(obj));
+						arrComponents.push(key);
+						extractComponents(variable[key]);
+					});
+				}
+				break;
+			default:
+				throw Error("getSourceString: unknown type="+(typeof variable)+" of "+variable+", object: "+JSON.stringify(obj));
+		}
+	}
+
+	extractComponents(obj);
+	return arrComponents.join(STRING_JOIN_CHAR);
+}
+
+
+function encodeMci(mci){
+	return (0xFFFFFFFF - mci).toString(16).padStart(8, '0'); // reverse order for more efficient sorting as we always need the latest
+}
+
+function getMciFromDataFeedKey(key){
+	var arrParts = key.split('\n');
+	var strReversedMci = arrParts[arrParts.length-1];
+	var reversed_mci = parseInt(strReversedMci, 16);
+	var mci = 0xFFFFFFFF - reversed_mci;
+	return mci;
+}
+
+// df:address:feed_name:type:value:strReversedMci
+function getValueFromDataFeedKey(key){
+	var m = key.split('\n');
+	if (m.length !== 6)
+		throw Error("wrong number of elements in data feed "+key);
+	var type = m[3];
+	var value = m[4];
+	return (type === 's') ? value : decodeLexicographicToDouble(value);
+}
+
+// returns a number if the value looks like a valid float
+function toNumber(value, bLimitedPrecision) {
+	if (typeof value === 'number')
+		return value;
+	if (bLimitedPrecision)
+		return getNumericFeedValue(value);
+	if (typeof value !== 'string')
+		throw Error("toNumber of not a string: "+value);
+	var m = value.match(/^[+-]?(\d+(\.\d+)?)([eE][+-]?(\d+))?$/);
+	if (!m)
+		return null;
+	var f = parseFloat(value);
+	if (!isFinite(f))
+		return null;
+	var mantissa = m[1];
+	var abs_exp = m[4];
+	if (f === 0 && mantissa > 0 && abs_exp > 0) // too small number out of range such as 1.23e-700
+		return null;
+	return f === 0 ? 0 : f; // replace -0
+}
+
+function getNumericFeedValue(value, bBySignificantDigits){
+	if (typeof value !== 'string')
+		throw Error("getNumericFeedValue of not a string: "+value);
+	var m = value.match(/^[+-]?(\d+(\.\d+)?)([eE][+-]?(\d+))?$/);
+	if (!m)
+		return null;
+	var f = parseFloat(value);
+	if (!isFinite(f))
+		return null;
+	var mantissa = m[1];
+	var abs_exp = m[4];
+	if (f === 0 && mantissa > 0 && abs_exp > 0) // too small number out of range such as 1.23e-700
+		return null;
+	if (bBySignificantDigits) {
+		var significant_digits = mantissa.replace(/^0+/, '');
+		if (significant_digits.indexOf('.') >= 0)
+			significant_digits = significant_digits.replace(/0+$/, '').replace('.', '');
+		if (significant_digits.length > 16)
+			return null;
+	}
+	else {
+		// mantissa can also be 123.456, 00.123, 1.2300000000, 123000000000, anyway too long number indicates we want to keep it as a string
+		if (mantissa.length > 15) // including the point (if any), including 0. in 0.123
+			return null;
+	}
+	return f === 0 ? 0 : f; // replace -0
+}
+
+// transformss the value to number is possible
+function getFeedValue(value, bLimitedPrecision){
+	var numValue = toNumber(value, bLimitedPrecision);
+	return (numValue === null) ? value : numValue;
+}
+
+// https://stackoverflow.com/questions/43299299/sorting-floating-point-values-using-their-byte-representation
+function encodeDoubleInLexicograpicOrder(float){
+	if (float === -0) // it is actually true for both 0's
+		float = 0; // we always assign a positive 0
+	var buf = Buffer.allocUnsafe(8);
+	buf.writeDoubleBE(float, 0);
+	if (float >= 0)
+		buf[0] ^= 0x80; // flip the sign bit
+	else
+		for (var i=0; i<buf.length; i++)
+			buf[i] ^= 0xff; // flip the sign bit and reverse the ordering
+	return buf.toString('hex');
+}
+
+function decodeLexicographicToDouble(hex){
+	var buf = Buffer.from(hex, 'hex');
+	if (buf[0] & 0x80) // first bit set: positive
+		buf[0] ^= 0x80; // flip the sign bit
+	else
+		for (var i=0; i<buf.length; i++)
+			buf[i] ^= 0xff; // flip the sign bit and reverse the ordering
+	var float = buf.readDoubleBE(0);
+	if (float === -0)
+		float = 0;
+	return float;
+}
+
+// https://github.com/uxitten/polyfill/blob/master/string.polyfill.js
+// https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/padStart
+if (!String.prototype.padStart) {
+	String.prototype.padStart = function padStart(targetLength, padString) {
+		targetLength = targetLength >> 0; //truncate if number, or convert non-number to 0;
+		padString = String(typeof padString !== 'undefined' ? padString : ' ');
+		if (this.length >= targetLength) {
+			return String(this);
+		} else {
+			targetLength = targetLength - this.length;
+			if (targetLength > padString.length) {
+				padString += padString.repeat(targetLength / padString.length); //append to original to ensure we are longer than needed
+			}
+			return padString.slice(0, targetLength) + String(this);
+		}
+	};
+}
+
+// https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/isWellFormed
+// Added in Node.js v20 / V8 v11.2. For older runtimes, a fast charCodeAt loop is used
+// (avoids regex engine overhead and exits at the first lone surrogate found).
+if (!String.prototype.isWellFormed) {
+	Object.defineProperty(String.prototype, 'isWellFormed', {
+		value: function isWellFormed() {
+			for (let i = 0; i < this.length; i++) {
+				const code = this.charCodeAt(i);
+				if (code >= 0xD800 && code <= 0xDBFF) {          // high surrogate
+					const next = this.charCodeAt(i + 1); // NaN if out of bounds
+					if (next >= 0xDC00 && next <= 0xDFFF)
+						i++;                                       // valid pair — skip low surrogate
+					else
+						return false;                              // lone high surrogate
+				}
+				else if (code >= 0xDC00 && code <= 0xDFFF)   // lone low surrogate
+					return false;
+			}
+			return true;
+		},
+		writable: true,
+		configurable: true,
+		enumerable: false,
+	});
+}
+
+// node 12+ implements well-formed JSON.stringify(), earlier versions could generate invalid UTF
+// https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON/stringify#Well-formed_JSON.stringify()
+var bWellFormedJsonStringify = (JSON.stringify("\uD800") === '"\\ud800"');
+function toWellFormedJsonStringify(obj) {
+	var str = JSON.stringify(obj);
+	// we used to replace all such symbols, not just lone surrogates
+	return /*bWellFormedJsonStringify ? str :*/ str.replace(/[\ud800-\udfff]/g, chr => "\\u" + chr.codePointAt(0).toString(16));
+}
+
+function getJsonSourceString(obj, bAllowEmpty) {
+	let cache = new WeakMap();  // object to stringified result
+	function stringify(variable){
+		if (variable === null)
+			throw Error("null value in "+JSON.stringify(obj));
+		switch (typeof variable){
+			case "string":
+				return toWellFormedJsonStringify(variable);
+			case "number":
+				if (!isFinite(variable))
+					throw Error("invalid number: " + variable);
+			case "boolean":
+				return variable.toString();
+			case "object":
+				// return cached result if already processed
+				if (cache.has(variable))
+					return cache.get(variable);
+				let result;
+				if (Array.isArray(variable)){
+					if (variable.length === 0 && !bAllowEmpty)
+						throw Error("empty array in "+JSON.stringify(obj));
+					result = '[' + variable.map(stringify).join(',') + ']';
+				}
+				else{
+					var keys = Object.keys(variable).sort();
+					if (keys.length === 0 && !bAllowEmpty)
+						throw Error("empty object in "+JSON.stringify(obj));
+					result = '{' + keys.map(function(key){ return toWellFormedJsonStringify(key)+':'+stringify(variable[key]) }).join(',') + '}';
+				}
+				cache.set(variable, result);  // memoize for future references
+				return result;
+			default:
+				throw Error("getJsonSourceString: unknown type="+(typeof variable)+" of "+variable+", object: "+JSON.stringify(obj));
+		}
+	}
+
+	return stringify(obj);
+}
+
+
+function isTooDeeplyNestedOrHasTooManyNodes(obj, depthLimit = 100, nodesLimit = 10000) {
+	let nodeCount = 0;
+
+	function check(variable, depth){
+		if (depth > depthLimit || nodeCount > nodesLimit)
+			return true;
+		if (variable === null || typeof variable !== "object")
+			return false;
+		if (Array.isArray(variable)) {
+			nodeCount += variable.length;
+			for (let v of variable)
+				if (check(v, depth + 1))
+					return true;
+		}
+		else {
+			nodeCount += Object.keys(variable).length;
+			for (let key in variable)
+				if (check(variable[key], depth + 1))
+					return true;
+		}
+		return false;
+	}
+
+	return check(obj, 1);
+}
+
+function isTooBigObj(obj, { depthLimit = 100, nodesLimit = 10000, lengthLimit = 1000000 }) {
+	let nodeCount = 0;
+	let length = 0;
+
+	function check(variable, depth){
+		if (depth > depthLimit || nodeCount > nodesLimit || length > lengthLimit)
+			return true;
+		if (typeof variable === "string")
+			length += variable.length;
+		else if (typeof variable === "number" || typeof variable === "boolean")
+			length += variable.toString().length;
+		else if (variable === null)
+			length += 4; // "null"
+		else if (typeof variable !== "object")
+			throw Error("isTooBigObj: unexpected type=" + (typeof variable) + " of " + variable);
+		if (length > lengthLimit)
+			return true;
+		if (typeof variable !== "object" || variable === null)
+			return false;
+		if (Array.isArray(variable)) {
+			nodeCount += variable.length;
+			for (let v of variable)
+				if (check(v, depth + 1))
+					return true;
+		}
+		else {
+			const keys = Object.keys(variable);
+			nodeCount += keys.length;
+			length += keys.reduce((sum, key) => sum + key.length, 0);
+			for (let key in variable)
+				if (check(variable[key], depth + 1))
+					return true;
+		}
+		return false;
+	}
+
+	return check(obj, 1);
+}
+
+// returns an object with sorted keys, for deterministic processing later
+function sortObject(obj) {
+	if (typeof obj !== 'object' || obj === null)
+		return obj === 0 ? 0 : obj; // replace -0
+
+	if (Array.isArray(obj))
+		return obj.map(sortObject); // recurse into array elements, preserve order
+
+	return Object.fromEntries(
+		Object.entries(obj)
+			.sort((a, b) => {
+				if (a[0] < b[0]) return -1;
+				if (a[0] > b[0]) return 1;
+				return 0;
+			})
+			.map(([key, value]) => [key, sortObject(value)])
+	);
+}
+
+// replaces all -0 (including nested ones) with 0, mutating arrays/objects in place
+function replaceNegativeZero(obj) {
+	if (typeof obj !== 'object' || obj === null)
+		return obj === 0 ? 0 : obj; // replace -0
+
+	if (Array.isArray(obj)) {
+		for (let i = 0; i < obj.length; i++)
+			obj[i] = replaceNegativeZero(obj[i]);
+	}
+	else {
+		for (const key in obj) {
+			if (Object.hasOwn(obj, key))
+				obj[key] = replaceNegativeZero(obj[key]);
+		}
+	}
+	return obj;
+}
+
+function isObjectWellFormed(obj) {
+	if (typeof obj !== 'object' || obj === null)
+		return typeof obj === 'string' ? obj.isWellFormed() && obj.indexOf('\0') === -1 : true;
+
+	if (Array.isArray(obj)) {
+		// for-loop is faster than .every
+		for (let i = 0; i < obj.length; i++) {
+			if (!isObjectWellFormed(obj[i])) return false;
+		}
+		return true;
+	}
+
+	for (const key in obj) {
+		if (Object.hasOwn(obj, key)) {
+			if (!key.isWellFormed() || key.indexOf('\0') >= 0) return false;
+			if (!isObjectWellFormed(obj[key])) return false;
+		}
+	}
+
+	return true;
+}
+
+// much faster than lodash cloneDeep
+// works correctly only for objects reachable through JSON
+// based on https://github.com/lukeed/klona/blob/master/src/json.js with a small optimization
+function cloneDeep(val) {
+	var k, out, tmp;
+
+	if (Array.isArray(val)) {
+		out = Array(k=val.length);
+		while (k--) out[k] = (tmp=val[k]) && typeof tmp === 'object' ? cloneDeep(tmp) : tmp;
+		return out;
+	}
+
+//	if (Object.prototype.toString.call(val) === '[object Object]') {
+	if (typeof val === 'object' && val !== null) {
+		out = {}; // null
+		for (k in val) {
+		//	if (!Object.hasOwn(val, k)) continue;
+			if (k === '__proto__') {
+				Object.defineProperty(out, k, {
+					value: cloneDeep(val[k]),
+					configurable: true,
+					enumerable: true,
+					writable: true,
+				});
+			} else {
+				out[k] = (tmp=val[k]) && typeof tmp === 'object' ? cloneDeep(tmp) : tmp;
+			}
+		}
+		return out;
+	}
+
+	return val === 0 ? 0 : val; // replace -0
+}
+
+
+exports.STRING_JOIN_CHAR = STRING_JOIN_CHAR; // for tests
+exports.getSourceString = getSourceString;
+exports.encodeMci = encodeMci;
+exports.getMciFromDataFeedKey = getMciFromDataFeedKey;
+exports.getValueFromDataFeedKey = getValueFromDataFeedKey;
+exports.toNumber = toNumber;
+exports.getNumericFeedValue = getNumericFeedValue;
+exports.getFeedValue = getFeedValue;
+exports.encodeDoubleInLexicograpicOrder = encodeDoubleInLexicograpicOrder;
+exports.decodeLexicographicToDouble = decodeLexicographicToDouble;
+exports.getJsonSourceString = getJsonSourceString;
+exports.isTooDeeplyNestedOrHasTooManyNodes = isTooDeeplyNestedOrHasTooManyNodes;
+exports.isTooBigObj = isTooBigObj;
+exports.sortObject = sortObject;
+exports.replaceNegativeZero = replaceNegativeZero;
+exports.isObjectWellFormed = isObjectWellFormed;
+exports.cloneDeep = cloneDeep;
